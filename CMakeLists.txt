@@ -128,3 +128,8 @@ configure_file("compiler/symcc.in" "symcc" @ONLY)
 configure_file("compiler/sym++.in" "sym++" @ONLY)
 
 add_subdirectory(test)
+
+option(BUILD_FUZZING_HELPER_CPP "Build the C++17 fuzzing helper alongside the Rust version" OFF)
+if(BUILD_FUZZING_HELPER_CPP)
+  add_subdirectory(util/symcc_fuzzing_helper/cpp)
+endif()
