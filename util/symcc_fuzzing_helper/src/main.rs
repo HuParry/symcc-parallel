@@ -56,6 +56,7 @@ struct CLI {
 
 /// Execution statistics.
 #[derive(Debug, Default)]
+// 累计执行统计，仅用于观察效率，不参与选样本和剪枝。
 struct Stats {
     /// Number of successful executions.
     total_count: u32,
@@ -157,6 +158,7 @@ impl Stats {
 /// Mutable run-time state.
 ///
 /// This is a collection of the state we update during execution.
+// 运行中维护的状态：覆盖图、已处理输入、输出目录和统计。
 struct State {
     /// The cumulative coverage of all test cases generated so far.
     current_bitmap: AflMap,
@@ -188,6 +190,7 @@ impl State {
     ///
     /// This involves creating the output directory and all required
     /// subdirectories.
+    // 创建实例输出目录和各子目录，并初始化内存状态。
     fn initialize(output_dir: impl AsRef<Path>) -> Result<Self> {
         let symcc_dir = output_dir.as_ref();
 
@@ -222,12 +225,14 @@ impl State {
     ) -> Result<()> {
         log::info!("Running on input {}", input.as_ref().display());
 
+        // 本轮生成样本存放在临时目录中，处理结束后自动清理。
         let tmp_dir = tempdir()
             .context("Failed to create a temporary directory for this execution of SymCC")?;
 
         let mut num_interesting = 0u64;
         let mut num_total = 0u64;
 
+        // 运行 SymCC 生成样本，再逐个用 AFL 插桩目标验证。
         let symcc_result = symcc
             .run(&input, tmp_dir.path().join("output"))
             .context("Failed to run SymCC")?;
@@ -247,6 +252,7 @@ impl State {
             num_interesting
         );
 
+        // SymCC 被终止时，将本轮原始输入归档到 hangs。
         if symcc_result.killed {
             log::info!(
                 "The target process was killed (probably timeout or out of memory); \
@@ -257,6 +263,7 @@ impl State {
                 .context("Failed to archive the test case")?;
         }
 
+        // 处理完成后记录输入路径，避免重复分析。
         self.processed_files.insert(input.as_ref().to_path_buf());
         self.stats.add_execution(&symcc_result);
         Ok(())
@@ -281,12 +288,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // afl_queue 是AFL保存测试用例的目录，symcc_fuzzing_helper需要从这个目录中获取AFL生成的测试用例
     let afl_queue = options.output_dir.join(&options.fuzzer_name).join("queue");
     if !afl_queue.is_dir() {
         log::error!("The AFL queue {} does not exist!", afl_queue.display());
         return Ok(());
     }
 
+    // symcc实例的工作目录，symcc_fuzzing_helper会在这个目录中保存symcc生成的测试用例
     let symcc_dir = options.output_dir.join(&options.name);
     if symcc_dir.is_dir() {
         log::error!(
@@ -296,24 +305,30 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // 根据Symcc工作目录和命令行参数创建SymCC配置对象
     let symcc = SymCC::new(symcc_dir.clone(), &options.command);
-    log::debug!("SymCC configuration: {:?}", &symcc);
+    log::debug!("\nSymCC configuration: {:?}", &symcc);
+    // 读取AFL的配置文件，获取AFL的运行参数。
     let afl_config = AflConfig::load(options.output_dir.join(&options.fuzzer_name))?;
-    log::debug!("AFL configuration: {:?}", &afl_config);
+    log::debug!("\nAFL configuration: {:?}", &afl_config);
+    // 创建state对象，初始化SymCC的工作目录和统计信息文件。mut表示允许修改变量。
     let mut state = State::initialize(symcc_dir)?;
 
     loop {
         match afl_config
-            .best_new_testcase(&state.processed_files)
+            .best_new_testcase(&state.processed_files)  // 挑选最优的未处理测试用例
+            // 函数会返回None、Some(PathBuf)或者Err，match根据结果选择对应分支进行处理
             .context("Failed to check for new test cases")?
         {
             None => {
                 log::debug!("Waiting for new test cases...");
-                thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(5));  // 如果没有新的测试用例，等待5秒后继续检查
             }
             Some(input) => state.test_input(&input, &symcc, &afl_config)?,
+            // 找到新的测试用例，调用test_input函数处理它，input是测试用例的路径。
         }
 
+        // 如果距离上次输出统计信息已经超过60秒，则输出当前的统计信息。
         if state.last_stats_output.elapsed().as_secs() > STATS_INTERVAL_SEC {
             if let Err(e) = state.stats.log(&mut state.stats_file) {
                 log::error!("Failed to log run-time statistics: {}", e);
@@ -352,6 +367,7 @@ fn process_new_testcase(
                 &testcase.as_ref().display()
             )
         })? {
+        // 相对于 helper 的累计覆盖图有新增位时，将样本保存到 queue。
         AflShowmapResult::Success(testcase_bitmap) => {
             let interesting = state.current_bitmap.merge(&testcase_bitmap);
             if interesting {
@@ -367,6 +383,7 @@ fn process_new_testcase(
                 Ok(TestcaseResult::Uninteresting)
             }
         }
+        // 验证时超时或执行失败的生成样本直接忽略。
         AflShowmapResult::Hang => {
             log::info!(
                 "Ignoring new test case {} because afl-showmap timed out on it",
@@ -374,6 +391,7 @@ fn process_new_testcase(
             );
             Ok(TestcaseResult::Hang)
         }
+        // 崩溃样本同时归档到 crashes 和 queue，供 AFL 同步导入。
         AflShowmapResult::Crash => {
             log::info!(
                 "Test case {} crashes afl-showmap; it is probably interesting",
