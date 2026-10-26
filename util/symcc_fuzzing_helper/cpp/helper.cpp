@@ -2,19 +2,27 @@
 #include "helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <future>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <memory>
 #include <poll.h>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <sys/inotify.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 extern char **environ;
@@ -22,6 +30,10 @@ extern char **environ;
 namespace helper {
 namespace {
 bool verbose = false;
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "Signal handling requires a lock-free stop flag");
+std::atomic<bool> stopRequested{false};
+std::mutex logMutex;
 std::map<std::string, int> logFilters;
 std::optional<std::regex> logPattern;
 int logLevel(const std::string &name) {
@@ -83,6 +95,57 @@ public:
     value_ = value;
   }
 };
+
+// Wake idle workers when AFL finishes publishing an input. Keep the periodic
+// scan as a fallback for unavailable watches, lost events and queue replacement.
+class QueueWatch {
+  Fd fd_;
+
+public:
+  explicit QueueWatch(const fs::path &queue)
+      : fd_(::inotify_init1(IN_NONBLOCK | IN_CLOEXEC)) {
+    if (fd_.get() >= 0 &&
+        ::inotify_add_watch(fd_.get(), queue.c_str(),
+                            IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE_SELF |
+                                IN_MOVE_SELF) < 0)
+      fd_.reset();
+    if (fd_.get() < 0)
+      log("WARN", "Queue notifications unavailable; using periodic scans");
+  }
+
+  bool changed() {
+    bool changed = false;
+    alignas(inotify_event) std::array<char, 4096> buffer;
+    while (fd_.get() >= 0) {
+      auto bytes = ::read(fd_.get(), buffer.data(), buffer.size());
+      if (bytes < 0 && errno == EINTR)
+        continue;
+      if (bytes < 0 && errno == EAGAIN)
+        break;
+      if (bytes <= 0) {
+        fd_.reset();
+        break;
+      }
+      changed = true;
+      for (size_t offset = 0; offset < static_cast<size_t>(bytes);) {
+        const auto *event = reinterpret_cast<const inotify_event *>(
+            buffer.data() + offset);
+        if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF))
+          fd_.reset();
+        offset += sizeof(inotify_event) + event->len;
+      }
+    }
+    return changed;
+  }
+
+  void wait() const {
+    pollfd descriptor{fd_.get(), POLLIN, 0};
+    // Also check completed futures and the stop flag at least every 50ms.
+    int ready = ::poll(&descriptor, 1, 50);
+    systemCheck(ready >= 0 || errno == EINTR, "Failed to wait for queue updates");
+  }
+};
+
 class TempDir {
 public:
   fs::path path;
@@ -182,6 +245,9 @@ ProcessResult runProcess(const std::vector<std::string> &args,
       }
       ::_exit(127);
     };
+    // Isolate each invocation so cancellation also stops target descendants.
+    if (::setpgid(0, 0) < 0)
+      childError(errno);
     if (::dup2(input ? inRead.get() : nullFd.get(), STDIN_FILENO) < 0 ||
         ::dup2(nullFd.get(), STDOUT_FILENO) < 0 ||
         ::dup2(captureStderr ? errWrite.get() : nullFd.get(), STDERR_FILENO) <
@@ -189,6 +255,8 @@ ProcessResult runProcess(const std::vector<std::string> &args,
       childError(errno);
     // Rust Command 默认让子进程使用正常的 SIGPIPE 语义。
     ::signal(SIGPIPE, SIG_DFL);
+    ::signal(SIGINT, SIG_DFL);
+    ::signal(SIGTERM, SIG_DFL);
     int savedError = ENOENT;
     for (const auto &candidate : candidates) {
       ::execve(candidate.c_str(), argv.data(), env.data());
@@ -204,12 +272,19 @@ ProcessResult runProcess(const std::vector<std::string> &args,
     pid_t pid;
     ~Reaper() {
       if (pid > 0) {
+        ::kill(-pid, SIGKILL);
         ::kill(pid, SIGKILL);
         while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
         }
       }
     }
   } reaper{pid};
+  Fd childExit;
+#ifdef SYS_pidfd_open
+  // A pidfd becomes readable on exit, without taking SIGCHLD away from other
+  // worker threads. Older kernels and restricted environments use the fallback.
+  childExit.reset(static_cast<int>(::syscall(SYS_pidfd_open, pid, 0)));
+#endif
   inRead.reset();
   errWrite.reset();
   execWrite.reset();
@@ -236,6 +311,8 @@ ProcessResult runProcess(const std::vector<std::string> &args,
   size_t length = 0, offset = 0;
   // 同时供给 stdin 和排空 stderr，避免大输入与大量日志互相堵塞管道。
   while (inWrite.get() >= 0 || errRead.get() >= 0) {
+    if (stopping())
+      fail("Execution interrupted");
     if (inWrite.get() >= 0 && offset == length) {
       ssize_t bytes;
       do {
@@ -253,14 +330,18 @@ ProcessResult runProcess(const std::vector<std::string> &args,
       break;
     int ready;
     do {
-      ready = ::poll(descriptors, 2, -1);
-    } while (ready < 0 && errno == EINTR);
+      ready = ::poll(descriptors, 2, 100);
+    } while (ready < 0 && errno == EINTR && !stopping());
+    if (stopping())
+      fail("Execution interrupted");
     systemCheck(ready >= 0, "Failed to poll child pipes");
     if (descriptors[0].revents & (POLLOUT | POLLERR | POLLHUP)) {
       ssize_t bytes =
           ::write(inWrite.get(), inputBuffer.data() + offset, length - offset);
       if (bytes > 0)
         offset += static_cast<size_t>(bytes);
+      else if (bytes < 0 && errno == EPIPE)
+        inWrite.reset(); // A target may finish without consuming all stdin.
       else if (bytes < 0 && errno != EINTR && errno != EAGAIN)
         fail("Failed to pipe the test input: " +
              std::string(std::strerror(errno)));
@@ -278,9 +359,26 @@ ProcessResult runProcess(const std::vector<std::string> &args,
   }
   int status;
   pid_t waited;
-  do {
-    waited = ::waitpid(pid, &status, 0);
-  } while (waited < 0 && errno == EINTR);
+  for (;;) {
+    if (stopping())
+      fail("Execution interrupted");
+    waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid)
+      break;
+    if (waited < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    if (childExit.get() >= 0) {
+      pollfd descriptor{childExit.get(), POLLIN, 0};
+      // The timeout bounds cancellation latency; exit wakes poll immediately.
+      int ready = ::poll(&descriptor, 1, 100);
+      systemCheck(ready >= 0 || errno == EINTR, "Failed to wait for child exit");
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
   systemCheck(waited == pid, "Failed to wait for child");
   reaper.pid = -1;
   return {status, std::move(output)};
@@ -343,6 +441,9 @@ std::optional<Duration> parseSolverTime(const std::string &output) {
   return parseSolverTimeImpl(output);
 }
 
+void requestStop() { stopRequested.store(true, std::memory_order_relaxed); }
+bool stopping() { return stopRequested.load(std::memory_order_relaxed); }
+
 void setVerbose(bool enabled) {
   verbose = enabled;
   logFilters.clear();
@@ -398,12 +499,14 @@ void log(const std::string &level, const std::string &message,
   auto now = std::time(nullptr);
   std::tm utc{};
   ::gmtime_r(&now, &utc);
+  std::lock_guard<std::mutex> lock(logMutex);
   std::cerr << '[' << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ") << ' ' << level
             << ' ' << target << "] " << message << '\n';
 }
 Options parseOptions(int argc, char **argv) {
   Options options;
-  bool haveOutput = false, haveFuzzer = false, haveName = false;
+  bool haveOutput = false, haveFuzzer = false, haveName = false,
+       haveJobs = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--") {
@@ -413,14 +516,19 @@ Options parseOptions(int argc, char **argv) {
     }
     if (arg == "-h" || arg == "--help") {
       std::cout << "Make SymCC collaborate with AFL.\nUsage: "
-                   "symcc_fuzzing_helper_cpp -o DIR -a FUZZER -n NAME [-v] -- "
-                   "PROGRAM [ARGS...]\n";
+                   "symcc_fuzzing_helper_cpp -o DIR -a FUZZER -n NAME "
+                   "[-j JOBS] [-v] -- PROGRAM [ARGS...]\n"
+                   "  -j, --jobs JOBS  Concurrent SymCC workers (default: 1)\n";
       std::exit(0);
     }
     if (arg == "-V" || arg == "--version") {
       std::cout << "symcc_fuzzing_helper_cpp 0.1.0\n";
       std::exit(0);
     }
+    if (arg == "--jobs")
+      arg = "-j";
+    else if (arg.compare(0, 7, "--jobs=") == 0)
+      arg = "-j" + arg.substr(7);
     if (arg.size() > 1 && arg[0] == '-') {
       for (size_t j = 1; j < arg.size(); ++j) {
         char key = arg[j];
@@ -428,7 +536,7 @@ Options parseOptions(int argc, char **argv) {
           options.verbose = true;
           continue;
         }
-        if (key != 'o' && key != 'a' && key != 'n')
+        if (key != 'o' && key != 'a' && key != 'n' && key != 'j')
           fail("Unknown option: " + arg);
         std::string value;
         const bool attached = j + 1 < arg.size();
@@ -458,6 +566,23 @@ Options parseOptions(int argc, char **argv) {
             fail("Duplicate -n");
           options.name = value;
           haveName = true;
+        }
+        if (key == 'j') {
+          if (haveJobs)
+            fail("Duplicate -j/--jobs");
+          if (value.empty() ||
+              value.find_first_not_of("0123456789") != std::string::npos)
+            fail("Jobs must be a positive integer");
+          unsigned long long jobs;
+          try {
+            jobs = std::stoull(value);
+          } catch (const std::exception &) {
+            fail("Jobs must be a positive integer within unsigned range");
+          }
+          if (jobs == 0 || jobs > std::numeric_limits<unsigned>::max())
+            fail("Jobs must be a positive integer within unsigned range");
+          options.jobs = static_cast<unsigned>(jobs);
+          haveJobs = true;
         }
         break;
       }
@@ -545,7 +670,8 @@ AflConfig AflConfig::load(const fs::path &directory) {
   return result;
 }
 std::optional<fs::path>
-AflConfig::bestNewTestcase(const std::unordered_set<fs::path> &seen) const {
+AflConfig::bestNewTestcase(const std::unordered_set<fs::path> &seen,
+                           const std::unordered_set<fs::path> &inFlight) const {
   std::optional<fs::path> best;
   Score bestScore;
   // AFL 可同时创建文件；文件评分失败时按最低优先级处理。
@@ -554,7 +680,8 @@ AflConfig::bestNewTestcase(const std::unordered_set<fs::path> &seen) const {
     entries.push_back(entry.path());
   for (const auto &path : entries) {
     std::error_code error;
-    if (!fs::is_regular_file(path, error) || seen.count(path))
+    if (!fs::is_regular_file(path, error) || seen.count(path) ||
+        inFlight.count(path))
       continue;
     auto candidate = score(path);
     if (!best || !(candidate < bestScore)) {
@@ -681,7 +808,8 @@ void Stats::write(std::ostream &out) const {
 }
 // 与 Rust File 相同，统计文件不应通过 exec 泄漏给目标或 afl-showmap。
 StatsFile::StatsFile(const fs::path &path)
-    : fd_(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666)) {
+    : fd_(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                 0666)) {
   systemCheck(fd_ >= 0, "Failed to create statistics file " + path.string());
 }
 StatsFile::~StatsFile() { ::close(fd_); }
@@ -706,8 +834,12 @@ void State::testInput(const fs::path &input, const SymCC &symcc,
   auto result = symcc.run(input, temporary.path / "output");
   uint64_t interesting = 0;
   for (const auto &testcase : result.testcases) {
+    if (stopping())
+      fail("Execution interrupted");
     log("DEBUG", "Processing test case " + testcase.string());
     auto checked = afl.runShowmap(temporary.path / "testcase_bitmap", testcase);
+    // Merge coverage and allocate output IDs atomically across all workers.
+    std::lock_guard<std::mutex> lock(mutex_);
     switch (checked.outcome) {
     case Outcome::Success:
       if (coverage_.merge(*checked.map)) {
@@ -731,18 +863,19 @@ void State::testInput(const fs::path &input, const SymCC &symcc,
   }
   log("INFO", "Generated " + std::to_string(result.testcases.size()) +
                   " test cases (" + std::to_string(interesting) + " new)");
+  std::lock_guard<std::mutex> lock(mutex_);
   if (result.killed) {
     log("INFO",
         "The target process was killed; archiving to " + hangs_.path.string());
     copyTestcase(input, hangs_, input);
   }
-  processed.insert(input);
   stats_.add(result);
 }
-void State::maybeWriteStats() {
-  if (std::chrono::duration_cast<std::chrono::seconds>(Clock::now() -
-                                                       lastStats_)
-          .count() <= 60)
+void State::maybeWriteStats(bool force) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() -
+                                                                  lastStats_);
+  if (!force && elapsed.count() <= 60)
     return;
   try {
     std::ostringstream output;
@@ -752,5 +885,103 @@ void State::maybeWriteStats() {
     log("ERROR", error.what());
   }
   lastStats_ = Clock::now();
+}
+
+Coordinator::Coordinator(const Options &options)
+    : directory_(fs::absolute(options.output / options.name)),
+      command_(options.command), jobs_(options.jobs),
+      afl_(AflConfig::load(options.output / options.fuzzer)),
+      state_(directory_) {
+  if (!jobs_)
+    fail("Jobs must be positive");
+}
+
+void Coordinator::run() {
+  struct Worker {
+    SymCC symcc;
+    std::optional<fs::path> input;
+    std::future<void> task;
+    Worker(const fs::path &directory, const std::vector<std::string> &command)
+        : symcc(directory, command) {}
+  };
+  std::vector<std::unique_ptr<Worker>> workers;
+  for (unsigned i = 0; i < jobs_; ++i) {
+    auto workspace = directory_;
+    if (jobs_ > 1) {
+      workspace /= "workers";
+      if (i == 0)
+        createDirectory(workspace);
+      workspace /= std::to_string(i);
+      createDirectory(workspace);
+    }
+    workers.push_back(std::make_unique<Worker>(workspace, command_));
+  }
+  QueueWatch incoming(afl_.queueDirectory());
+  log("INFO",
+      "Coordinator started with " + std::to_string(jobs_) + " SymCC worker(s)");
+
+  // Only the coordinator accesses these sets. Reserve an input before launch
+  // and move it to processed only after successful completion of the whole job.
+  std::unordered_set<fs::path> inFlight;
+  auto nextScan = Clock::now();
+  try {
+    while (!stopping()) {
+      for (auto &worker : workers) {
+        if (!worker->task.valid())
+          continue;
+        auto status = worker->task.wait_for(std::chrono::seconds(0));
+        if (status != std::future_status::ready)
+          continue;
+        // Worker failures are reported by the coordinator.
+        worker->task.get();
+        state_.processed.insert(*worker->input);
+        inFlight.erase(*worker->input);
+        worker->input.reset();
+        nextScan = Clock::now();
+      }
+      if (incoming.changed())
+        nextScan = Clock::now();
+      if (Clock::now() >= nextScan) {
+        for (size_t i = 0; i < workers.size(); ++i) {
+          auto &worker = workers[i];
+          if (worker->input || stopping())
+            continue;
+          auto input = afl_.bestNewTestcase(state_.processed, inFlight);
+          if (!input)
+            break;
+          inFlight.insert(*input);
+          worker->input = *input;
+          log("DEBUG", "Dispatching " + input->string() + " to worker " +
+                           std::to_string(i));
+          worker->task = std::async(
+              std::launch::async, [this, slot = worker.get(), input = *input] {
+                state_.testInput(input, slot->symcc, afl_);
+              });
+        }
+        nextScan = Clock::now() + std::chrono::seconds(5);
+      }
+      state_.maybeWriteStats();
+      incoming.wait();
+    }
+  } catch (...) {
+    // Cancel siblings before future destruction joins them.
+    requestStop();
+    for (auto &worker : workers)
+      if (worker->task.valid())
+        worker->task.wait();
+    state_.maybeWriteStats(true);
+    throw;
+  }
+  for (auto &worker : workers) {
+    if (!worker->task.valid())
+      continue;
+    try {
+      worker->task.get();
+    } catch (const std::exception &error) {
+      log("DEBUG", "Worker stopped: " + std::string(error.what()));
+    }
+  }
+  state_.maybeWriteStats(true);
+  log("INFO", "Coordinator stopped; all workers have been reaped");
 }
 } // namespace helper

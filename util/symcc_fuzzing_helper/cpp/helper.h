@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -20,10 +21,13 @@ struct Options {
   fs::path output;
   std::string fuzzer, name;
   bool verbose = false;
+  unsigned jobs = 1;
   std::vector<std::string> command;
 };
 Options parseOptions(int argc, char **argv);
 void setVerbose(bool enabled);
+void requestStop();
+bool stopping();
 void log(const std::string &level, const std::string &message,
          const std::string &target = "symcc_fuzzing_helper");
 std::optional<Duration> parseSolverTime(const std::string &output);
@@ -55,8 +59,10 @@ class AflConfig {
 
 public:
   static AflConfig load(const fs::path &directory);
+  const fs::path &queueDirectory() const { return queue_; }
   std::optional<fs::path>
-  bestNewTestcase(const std::unordered_set<fs::path> &seen) const;
+  bestNewTestcase(const std::unordered_set<fs::path> &seen,
+                  const std::unordered_set<fs::path> &inFlight) const;
   ShowmapResult runShowmap(const fs::path &bitmap,
                            const fs::path &testcase) const;
 };
@@ -97,6 +103,8 @@ public:
 };
 
 class State {
+  // Workers only hold this lock while publishing results, never during exec.
+  std::mutex mutex_;
   AflMap coverage_;
   TestcaseDir queue_, hangs_, crashes_;
   Stats stats_;
@@ -104,10 +112,25 @@ class State {
   Clock::time_point lastStats_ = Clock::now();
 
 public:
+  // Only accessed by the coordinator; running inputs are tracked separately.
   std::unordered_set<fs::path> processed;
   explicit State(const fs::path &directory);
   void testInput(const fs::path &input, const SymCC &symcc,
                  const AflConfig &afl);
-  void maybeWriteStats();
+  void maybeWriteStats(bool force = false);
+};
+
+// One coordinator dispatches distinct inputs to a bounded number of workers.
+// Each worker owns its input file and persistent runtime bitmap.
+class Coordinator {
+  fs::path directory_;
+  std::vector<std::string> command_;
+  unsigned jobs_;
+  AflConfig afl_;
+  State state_;
+
+public:
+  explicit Coordinator(const Options &options);
+  void run();
 };
 } // namespace helper

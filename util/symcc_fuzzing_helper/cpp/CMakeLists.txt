@@ -11,3 +11,14 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_
     target_link_libraries(symcc_fuzzing_helper_cpp PRIVATE stdc++fs)
 endif ()
 install(TARGETS symcc_fuzzing_helper_cpp RUNTIME DESTINATION bin)
+
+include(CTest)
+if (BUILD_TESTING)
+    find_program(HELPER_CPP_PYTHON NAMES python3)
+    if (HELPER_CPP_PYTHON)
+        add_test(NAME helper_cpp_parallel
+            COMMAND "${HELPER_CPP_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py"
+                    "$<TARGET_FILE:symcc_fuzzing_helper_cpp>")
+        set_tests_properties(helper_cpp_parallel PROPERTIES TIMEOUT 90)
+    endif ()
+endif ()

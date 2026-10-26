@@ -3,7 +3,10 @@
 
 #include <csignal>
 #include <iostream>
-#include <thread>
+
+namespace {
+void stop(int) { helper::requestStop(); }
+} // namespace
 
 int main(int argc, char **argv) {
   try {
@@ -11,6 +14,8 @@ int main(int argc, char **argv) {
     helper::setVerbose(options.verbose);
     // 管道提前关闭时由写入错误处理，避免 helper 被 SIGPIPE 直接终止。
     std::signal(SIGPIPE, SIG_IGN);
+    std::signal(SIGINT, stop);
+    std::signal(SIGTERM, stop);
     if (!helper::fs::is_directory(options.output)) {
       helper::log("ERROR", "The directory " + options.output.string() +
                                " does not exist!");
@@ -30,20 +35,8 @@ int main(int argc, char **argv) {
                       " already exists; we do not currently support resuming");
       return 0;
     }
-    helper::SymCC symcc(directory, options.command);
-    auto afl = helper::AflConfig::load(aflDirectory);
-    helper::State state(directory);
-    // 保持 Rust 版的单输入串行调度；AFL 进程独立运行。
-    for (;;) {
-      auto input = afl.bestNewTestcase(state.processed);
-      if (input)
-        state.testInput(*input, symcc, afl);
-      else {
-        helper::log("DEBUG", "Waiting for new test cases...");
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-      }
-      state.maybeWriteStats();
-    }
+    helper::Coordinator coordinator(options);
+    coordinator.run();
   } catch (const std::exception &error) {
     std::cerr << "Error: " << error.what() << '\n';
     return 1;
