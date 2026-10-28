@@ -22,8 +22,6 @@ jobs:
         llvm_version: [11, 12, 13, 14, 15]
     steps:
       - uses: actions/checkout@v3
-        with:
-          submodules: true
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -49,8 +47,6 @@ jobs:
         llvm_version: [16] # 17]
     steps:
       - uses: actions/checkout@v3
-        with:
-          submodules: true
       - name: Add LLVM project deb repository
         uses: myci-actions/add-deb-repo@11
         with:

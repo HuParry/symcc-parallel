@@ -31,16 +31,10 @@ Alternatively, see below for using the provided Dockerfile, or the file
 `util/quicktest.sh` for exact steps to perform under Ubuntu (or use with the
 provided Vagrant file).
 
-Make sure to pull the QSYM code:
-
-```
-$ git submodule init
-$ git submodule update
-```
-
-Note that it is not necessary or recommended to build the QSYM submodule - our
-build system will automatically extract the right source files and include them
-in the build.
+The QSYM sources needed by SymCC are included directly in this repository under
+`runtime/qsym_backend/qsym`. A normal `git clone` includes them; no `--recursive`
+or submodule commands are needed. Our build system compiles the required source
+files automatically. Z3 is still installed separately as described above.
 
 Create a build directory somewhere, and execute the following commands inside
 it:
@@ -146,13 +140,11 @@ On YouTube you can find [a practical introduction to SymCC](https://www.youtube.
 ## Building a Docker image
 
 If you prefer a Docker container over building SymCC natively, just tell Docker
-to build the image after pulling the QSYM code as above. (Be warned though: the
+to build the image from this checkout. (Be warned though: the
 Docker image enables optional C++ support from source, so creating
 the image can take quite some time!)
 
 ```
-$ git submodule init
-$ git submodule update
 $ docker build -t symcc .
 $ docker run -it --rm symcc
 ```
