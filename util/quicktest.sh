@@ -22,18 +22,13 @@ sudo apt-get upgrade -y
 sudo apt-get install -y git cargo clang-10 cmake g++ git libz3-dev llvm-10-dev llvm-10-tools ninja-build python2 python3-pip zlib1g-dev
 sudo pip3 install lit
 
-# Clone project 
-git clone https://github.com/eurecom-s3/symcc.git
-cd symcc
-
-# init/update submodules 
-git submodule init
-git submodule update
+# Test this checkout, which already includes the QSYM sources.
+SYMCC_SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 #  build
-mkdir ../symcc-build
-cd ../symcc-build
-cmake -G Ninja -DQSYM_BACKEND=ON  -DZ3_TRUST_SYSTEM_VERSION=on ../symcc
+mkdir -p "$SYMCC_SOURCE_DIR/../symcc-build"
+cd "$SYMCC_SOURCE_DIR/../symcc-build"
+cmake -G Ninja -DQSYM_BACKEND=ON -DZ3_TRUST_SYSTEM_VERSION=on "$SYMCC_SOURCE_DIR"
 ninja check
 
 # create a test case 

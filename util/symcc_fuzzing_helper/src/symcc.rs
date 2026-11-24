@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 const TIMEOUT: u32 = 90;
 
 /// Replace the first '@@' in the given command line with the input file.
+// 将命令中的第一个独立 @@ 参数替换为输入文件路径。
 fn insert_input_file<S: AsRef<OsStr>, P: AsRef<Path>>(
     command: &[S],
     input_file: P,
@@ -75,6 +76,7 @@ impl AflMap {
     ///
     /// Return true if the map has changed, i.e., if the other map yielded new
     /// coverage.
+    // 按位合并覆盖图，出现此前没有记录的位时返回 true。
     pub fn merge(&mut self, other: &AflMap) -> bool {
         let mut interesting = false;
         for (known, new) in self.data.iter_mut().zip(other.data.iter()) {
@@ -92,6 +94,7 @@ impl AflMap {
 ///
 /// We use the lexical comparison implemented by the derived implementation of
 /// Ord in order to compare according to various criteria.
+// 按字段顺序比较优先级：+cov、原始种子、更小文件、排序更大的文件名。
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct TestcaseScore {
     /// First criterion: new coverage
@@ -177,6 +180,7 @@ impl TestcaseDir {
 
 /// Copy a test case to a directory, using the parent test case's name to derive
 /// the new name.
+// 按 AFL 格式复制样本，用父输入的 ID 记录来源。
 pub fn copy_testcase(
     testcase: impl AsRef<Path>,
     target_dir: &mut TestcaseDir,
@@ -249,6 +253,7 @@ pub enum AflShowmapResult {
 
 impl AflConfig {
     /// Read the AFL configuration from a fuzzer instance's output directory.
+    // 从 fuzzer_stats 的启动命令还原 AFL 目标参数及 afl-showmap 路径。
     pub fn load(fuzzer_output: impl AsRef<Path>) -> Result<Self> {
         let afl_stats_file_path = fuzzer_output.as_ref().join("fuzzer_stats");
         let mut afl_stats_file = File::open(&afl_stats_file_path).with_context(|| {
@@ -299,6 +304,7 @@ impl AflConfig {
     }
 
     /// Return the most promising unseen test case of this fuzzer.
+    // 扫描 AFL 队列，排除非文件和已处理路径，选择评分最高的输入。
     pub fn best_new_testcase(&self, seen: &HashSet<PathBuf>) -> Result<Option<PathBuf>> {
         let best = fs::read_dir(&self.queue)
             .with_context(|| {
@@ -318,10 +324,15 @@ impl AflConfig {
             .map(|entry| entry.path())
             .filter(|path| path.is_file() && !seen.contains(path))
             .max_by_key(|path| TestcaseScore::new(path));
+            // 选择一个尚未处理的，优先级最高的输入。
+            // +cov结尾优先级最高，orig文件次之，然后按文件大小和文件名排序。
+            // +cov结尾的文件代表发现了新的覆盖位置。
+            // HashSet<PathBuf>存储了已经处理过的输入路径，避免重复处理。
 
         Ok(best)
     }
 
+    // 使用 AFL 插桩目标验证生成样本，获取覆盖图或判定超时、崩溃。
     pub fn run_showmap(
         &self,
         testcase_bitmap: impl AsRef<Path>,
@@ -333,6 +344,7 @@ impl AflConfig {
             afl_show_map.arg("-Q");
         }
 
+        // 验证限时 5 秒、不限制内存，并输出二进制覆盖图。
         afl_show_map
             .args(&["-t", "5000", "-m", "none", "-b", "-o"])
             .arg(testcase_bitmap.as_ref())
@@ -386,6 +398,7 @@ impl AflConfig {
 
 /// The run-time configuration of SymCC.
 #[derive(Debug)]
+// 这里的磁盘 bitmap 用于 QSYM 跨次执行剪枝，与 State 的内存覆盖图不同。
 pub struct SymCC {
     /// Do we pass data to standard input?
     use_standard_input: bool,
@@ -414,6 +427,7 @@ pub struct SymCCResult {
 
 impl SymCC {
     /// Create a new SymCC configuration.
+    // 只准备配置：有 @@ 时使用文件输入，否则使用标准输入。
     pub fn new(output_dir: PathBuf, command: &[String]) -> Self {
         let input_file = output_dir.join(".cur_input");
 
@@ -427,6 +441,7 @@ impl SymCC {
 
     /// Try to extract the solver time from the logs produced by the Qsym
     /// backend.
+    // 从日志末尾查找最后一个有效 SMT 求解耗时，单位为微秒。
     fn parse_solver_time(output: Vec<u8>) -> Option<Duration> {
         let re = Regex::new(r#""solving_time": (\d+)"#).unwrap();
         output
@@ -458,6 +473,7 @@ impl SymCC {
         input: impl AsRef<Path>,
         output_dir: impl AsRef<Path>,
     ) -> Result<SymCCResult> {
+        // 将本轮输入复制到固定工作文件 .cur_input。
         fs::copy(&input, &self.input_file).with_context(|| {
             format!(
                 "Failed to copy the test case {} to our workbench at {}",
@@ -473,6 +489,7 @@ impl SymCC {
             )
         })?;
 
+        // 分析限时 90 秒，终止宽限 5 秒；配置 QSYM 剪枝和本轮样本输出目录。
         let mut analysis_command = Command::new("timeout");
         analysis_command
             .args(&["-k", "5", &TIMEOUT.to_string()])
@@ -483,6 +500,7 @@ impl SymCC {
             .stdout(Stdio::null())
             .stderr(Stdio::piped()); // capture SMT logs
 
+        // 文件输入时用 SYMCC_INPUT_FILE 告知运行时应符号化哪个文件。
         if self.use_standard_input {
             analysis_command.stdin(Stdio::piped());
         } else {
@@ -514,6 +532,7 @@ impl SymCC {
             .wait_with_output()
             .context("Failed to wait for SymCC")?;
         let total_time = start.elapsed();
+        // 按当前退出码或信号规则判断是否被终止；非零退出码不一定记为 killed。
         let killed = match result.status.code() {
             Some(code) => {
                 log::debug!("SymCC returned code {}", code);
@@ -528,6 +547,7 @@ impl SymCC {
             }
         };
 
+        // 收集本轮生成的样本路径，交给调用者验证和筛选。
         let new_tests = fs::read_dir(&output_dir)
             .with_context(|| {
                 format!(

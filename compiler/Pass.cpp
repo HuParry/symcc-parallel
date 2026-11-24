@@ -60,13 +60,17 @@ bool instrumentModule(Module &M) {
     auto name = function.getName();
     if (isInterceptedFunction(function))
       function.setName(name + "_symbolized");
-  }
+  } /*
+    遍历模块中的函数，若为设定的待插桩函数，则进行改名处理（名字_symbolized）。
+    待插桩函数列表在compiler/Runtime.cpp下的
+  */
 
   // Insert a constructor that initializes the runtime and any globals.
   Function *ctor;
   std::tie(ctor, std::ignore) = createSanitizerCtorAndInitFunctions(
       M, kSymCtorName, "_sym_initialize", {}, {});
   appendToGlobalCtors(M, ctor, 0);
+  /*  在模块中插入一个构造函数__sym_ctor，该函数会在程序启动时调用_sym_initialize函数进行初始化。 */
 
   return true;
 }
@@ -142,9 +146,12 @@ void liftInlineAssembly(CallInst *CI) {
     errs() << "Warning: can't get target info to lift inline assembly\n";
     return;
   }
-
+  /* 先获取module，然后获取triple。triple中记录了是给哪个平台生成代码的，
+   * 并通过TargetRegistry::lookupTarget找到适配的目标架构。
+   */
   auto cpu = F->getFnAttribute("target-cpu").getValueAsString();
   auto features = F->getFnAttribute("target-features").getValueAsString();
+  /* 获取CPU参数和指令拓展 */
 
   std::unique_ptr<TargetMachine> TM(
       target->createTargetMachine(triple, cpu, features, TargetOptions(), {}));
@@ -157,12 +164,16 @@ void liftInlineAssembly(CallInst *CI) {
     return;
 
   targetLowering->ExpandInlineAsm(CI);
+  /* 将CPU信息和拓展信息作为参数构建TargetMachine对象，并通过getSubtargetImpl()函数
+   * 得到subTarget对象，最后从得到subTarget对象中获取TargetLowering对象，
+   * 并调用ExpandInlineAsm()函数将内联汇编转换为LLVM IR。
+   */
 }
 
 bool instrumentFunction(Function &F) {
   auto functionName = F.getName();
   if (functionName == kSymCtorName)
-    return false;
+    return false; /* 获取函数名，若为__sym_ctor则跳过 */
 
   DEBUG(errs() << "Symbolizing function ");
   DEBUG(errs().write_escaped(functionName) << '\n');
@@ -182,19 +193,31 @@ bool instrumentFunction(Function &F) {
       }
     }
   }
+  /* allInstructions存储了当前function的所有指令，然后开始对LLVM IR进行处理。
+   * F.getParent()->getDataLayout()通过获取module的DataLayout从而获取目标机器的参数。
+   * IntrinsicLowering对象负责将intrinsic调用转换成更底层的LLVM IR指令。
+   * dyn_cast<CallInst>(I)确保提取出来的是CallInst对象。
+   * 如果可以转换，直接转换成IR指令，否则就判断是不是内联汇编。
+   * 是内联汇编的话，就通过liftInlineAssembly(CI)转换成IR。
+   * */
+
 
   allInstructions.clear();
   for (auto &I : instructions(F))
     allInstructions.push_back(&I);
 
   Symbolizer symbolizer(*F.getParent());
-  symbolizer.symbolizeFunctionArguments(F);
+  /* Symbolizer对象用于对LLVM Module中的IR进行符号化 */
+  symbolizer.symbolizeFunctionArguments(F);  // 对函数参数进行符号化处理
 
   for (auto &basicBlock : F)
     symbolizer.insertBasicBlockNotification(basicBlock);
+  /* 遍历basic block，通过插入调用，使得runtime库能正确获得basic block的入口 */
 
-  for (auto *instPtr : allInstructions)
+  for (auto *instPtr : allInstructions) {
     symbolizer.visit(instPtr);
+  }
+  /* 遍历指令集并调用visit函数，所有实现都在compiler/Symbolizer.cpp中 */
 
   symbolizer.finalizePHINodes();
   symbolizer.shortCircuitExpressionUses();

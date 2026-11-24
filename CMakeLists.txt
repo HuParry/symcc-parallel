@@ -12,7 +12,7 @@
 # You should have received a copy of the GNU General Public License along with
 # SymCC. If not, see <https://www.gnu.org/licenses/>.
 
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(SymbolicCompiler)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
@@ -128,3 +128,8 @@ configure_file("compiler/symcc.in" "symcc" @ONLY)
 configure_file("compiler/sym++.in" "sym++" @ONLY)
 
 add_subdirectory(test)
+
+option(BUILD_FUZZING_HELPER_CPP "Build the C++17 fuzzing helper alongside the Rust version" OFF)
+if(BUILD_FUZZING_HELPER_CPP)
+  add_subdirectory(util/symcc_fuzzing_helper/cpp)
+endif()

@@ -29,6 +29,7 @@ void Symbolizer::symbolizeFunctionArguments(Function &F) {
   // The main function doesn't receive symbolic arguments.
   if (F.getName() == "main")
     return;
+  /* 对main函数不进行符号化处理 */
 
   IRBuilder<> IRB(F.getEntryBlock().getFirstNonPHI());
 
@@ -37,11 +38,22 @@ void Symbolizer::symbolizeFunctionArguments(Function &F) {
       symbolicExpressions[&arg] = IRB.CreateCall(runtime.getParameterExpression,
                                                  IRB.getInt8(arg.getArgNo()));
   }
+  /* 创建IRBuilder对象来插入IR指令，插入点设为入口entryblock的第一个不是phi指令的位置来插入。
+   * 之后遍历函数的所有参数，分别创建调用，以获取对应参数的符号表达式，并存入map中。
+   * （注意，只有被使用过的才会创建符号表达式）
+   * 该函数在IR中插入的效果：
+   * %0 = call i8* @_sym_get_parameter_expression(i8 0)
+   * %1 = call i8* @_sym_get_parameter_expression(i8 1)
+  */
 }
 
 void Symbolizer::insertBasicBlockNotification(llvm::BasicBlock &B) {
   IRBuilder<> IRB(&*B.getFirstInsertionPt());
   IRB.CreateCall(runtime.notifyBasicBlock, getTargetPreferredInt(&B));
+  /* 在基本块的第一个可插入点插入调用，通知runtime进入了该基本块。
+   * 插入效果：
+   * call void @_sym_notify_basic_block(i64 95399562032976)
+   */
 }
 
 void Symbolizer::finalizePHINodes() {
@@ -344,6 +356,10 @@ void Symbolizer::handleIntrinsicCall(CallBase &I) {
   }
 }
 
+/*
+ * 对内联汇编进行符号化处理，符号执行无法处理内联汇编。
+ * 如果返回void，直接打印跳过信息，如果不是，则打印警告信息。
+ */
 void Symbolizer::handleInlineAssembly(CallInst &I) {
   if (I.getType()->isVoidTy()) {
     errs() << "Warning: skipping over inline assembly " << I << '\n';
@@ -354,27 +370,45 @@ void Symbolizer::handleInlineAssembly(CallInst &I) {
          << I << '\n';
 }
 
+/*
+ * 处理函数调用的符号化
+ */
 void Symbolizer::handleFunctionCall(CallBase &I, Instruction *returnPoint) {
   auto *callee = I.getCalledFunction();
   if (callee != nullptr && callee->isIntrinsic()) {
     handleIntrinsicCall(I);
     return;
-  }
+  } /* 若为内部调用，则跳转内部调用函数来处理 */
 
   IRBuilder<> IRB(returnPoint);
   IRB.CreateCall(runtime.notifyRet, getTargetPreferredInt(&I));
   IRB.SetInsertPoint(&I);
   IRB.CreateCall(runtime.notifyCall, getTargetPreferredInt(&I));
+  /* 在返回点前插入“返回通知”，在IR中的表示形式如下：
+   * call void @_sym_notify_ret(i64 97223178565296)
+   * 在调用点的位置插入“调用通知”，在IR中的表示形式如下：
+   * call void @_sym_notify_call(i64 97223178565296)
+   */
 
   if (callee == nullptr)
     tryAlternative(IRB, I.getCalledOperand());
+  /* 当callee为null时，说明此时的函数调用可能是间接调用（不知道函数名），
+   * 因为getCalledFunction()函数获取不到间接调用的函数名。
+   * 由tryAlternative()对间接调用部分进行符号化。
+   * 例如call i32 @foo(i32 %x)，可以得到callee为@foo，但是若
+   * call i32 %f(i32 %x)，则无法获取函数名，返回nullptr。
+   */
 
   for (Use &arg : I.args())
     IRB.CreateCall(runtime.setParameterExpression,
                    {ConstantInt::get(IRB.getInt8Ty(), arg.getOperandNo()),
                     getSymbolicExpressionOrNull(arg)});
+          /* 遍历函数参数，对每个参数创建调用，设置参数的符号表达式。
+           * 在IR中的形式为：call void @_sym_set_parameter_expression(i8 0, i8* null)
+           * arg.getOperandNo()是获取当前的arg是第几个参数。
+           */
 
-  if (!I.user_empty()) {
+  if (!I.user_empty()) { /* 若该函数的结果会被使用，则需要确保返回结果是符号表达式 */
     // The result of the function is used somewhere later on. Since we have no
     // way of knowing whether the function is instrumented (and thus sets a
     // proper return expression), we have to account for the possibility that
@@ -385,16 +419,26 @@ void Symbolizer::handleFunctionCall(CallBase &I, Instruction *returnPoint) {
     // override our null with the real expression.)
     IRB.CreateCall(runtime.setReturnExpression,
                    ConstantPointerNull::get(IRB.getInt8PtrTy()));
+    /* 设置返回结果为null，在IR中表示为：
+     * call void @_sym_set_return_expression(i8* null)
+     */
     IRB.SetInsertPoint(returnPoint);
     symbolicExpressions[&I] = IRB.CreateCall(runtime.getReturnExpression);
+    /* 在返回点插入获取返回结果的调用，即若成功插桩，会返回符号表达式。
+     * 在IR中表示为：
+     * %15 = call i8* @_sym_get_return_expression()
+     */
   }
 }
-
+/*
+ * 对二元运算符进行符号化处理
+ */
 void Symbolizer::visitBinaryOperator(BinaryOperator &I) {
   // Binary operators propagate into the symbolic expression.
 
   IRBuilder<> IRB(&I);
   SymFnT handler = runtime.binaryOperatorHandlers.at(I.getOpcode());
+  /* 获取二元运算符对应的符号表达式 */
 
   // Special case: the run-time library distinguishes between "and" and "or"
   // on Boolean values and bit vectors.
@@ -415,22 +459,41 @@ void Symbolizer::visitBinaryOperator(BinaryOperator &I) {
       break;
     }
   }
+  /*
+   * 根据二元运算符的类型选择相应的符号表达式处理函数，逻辑运算符单独拉出来判断并处理。
+   */
 
   assert(handler && "Unable to handle binary operator");
   auto runtimeCall =
       buildRuntimeCall(IRB, handler, {I.getOperand(0), I.getOperand(1)});
   registerSymbolicComputation(runtimeCall, &I);
+  /*
+   * 根据二元运算符的两个操作数构建符号表达式，并将其注册为该指令的符号表达式。
+   * registerSymbolicComputation()函数会将符号表达式和指令的映射关系存入symbolicExpressions中。
+   */
 }
 
+/*
+ * 对一元运算符进行符号化处理
+ */
 void Symbolizer::visitUnaryOperator(UnaryOperator &I) {
   IRBuilder<> IRB(&I);
   SymFnT handler = runtime.unaryOperatorHandlers.at(I.getOpcode());
+  /* 获取一元运算符对应符号表达式 */
 
   assert(handler && "Unable to handle unary operator");
   auto runtimeCall = buildRuntimeCall(IRB, handler, I.getOperand(0));
   registerSymbolicComputation(runtimeCall, &I);
+  /*
+   * 根据一元运算符的操作数构建符号表达式，并将其注册为该指令的符号表达式。
+   * registerSymbolicComputation()函数会将符号表达式和指令的映射关系存入symbolicExpressions中。
+   */
 }
 
+/*
+ * 对三元运算符进行符号化处理(?:语句)
+ * 也就是IR中的select语句
+ */
 void Symbolizer::visitSelectInst(SelectInst &I) {
   // Select is like the ternary operator ("?:") in C. We push the (potentially
   // negated) condition to the path constraints and copy the symbolic
@@ -441,9 +504,15 @@ void Symbolizer::visitSelectInst(SelectInst &I) {
                                       {{I.getCondition(), true},
                                        {I.getCondition(), false},
                                        {getTargetPreferredInt(&I), false}});
+  /*
+   * 创建压入路径约束的函数调用，这个约束就是跳转条件
+   * 在IR中的插入形式：
+   * call void @_sym_push_path_constraint(i8* %9, i1 %cmp, i64 103576236458992)
+   */
   registerSymbolicComputation(runtimeCall);
   if (getSymbolicExpression(I.getTrueValue()) ||
       getSymbolicExpression(I.getFalseValue())) {
+    /* 两个候选值中只要有一个是symbolic的，就需要创建符号表达式 */
     auto *data = IRB.CreateSelect(
         I.getCondition(), getSymbolicExpressionOrNull(I.getTrueValue()),
         getSymbolicExpressionOrNull(I.getFalseValue()));
@@ -451,18 +520,25 @@ void Symbolizer::visitSelectInst(SelectInst &I) {
   }
 }
 
+/*
+ * 对比较指令进行符号化处理
+ */
 void Symbolizer::visitCmpInst(CmpInst &I) {
   // ICmp is integer comparison, FCmp compares floating-point values; we
   // simply include either in the resulting expression.
 
   IRBuilder<> IRB(&I);
   SymFnT handler = runtime.comparisonHandlers.at(I.getPredicate());
+  /* 获取比较运算符的符号表达式 */
   assert(handler && "Unable to handle icmp/fcmp variant");
   auto runtimeCall =
       buildRuntimeCall(IRB, handler, {I.getOperand(0), I.getOperand(1)});
   registerSymbolicComputation(runtimeCall, &I);
 }
 
+/*
+ * 处理return指令的符号表达式
+ */
 void Symbolizer::visitReturnInst(ReturnInst &I) {
   // Upon return, we just store the expression for the return value.
 
@@ -478,6 +554,10 @@ void Symbolizer::visitReturnInst(ReturnInst &I) {
                  getSymbolicExpressionOrNull(I.getReturnValue()));
 }
 
+/*
+ * 处理分支指令的符号化，（即br跳转指令）
+ * 处理方法和之前的select指令处理方式相似，只不过少了候选值的符号化操作
+ */
 void Symbolizer::visitBranchInst(BranchInst &I) {
   // Br can jump conditionally or unconditionally. We are only interested in
   // the former case, in which we push the branch condition or its negation to
@@ -485,6 +565,10 @@ void Symbolizer::visitBranchInst(BranchInst &I) {
 
   if (I.isUnconditional())
     return;
+  /*
+   * br可以是条件跳转也可以是无条件跳转。Symcc只关心条件跳转，因为这样会产生条件约束。
+   * 因此，用isUnconditional()函数来判断是否有条件，如果没有就无需处理直接返回。
+   */
 
   IRBuilder<> IRB(&I);
   auto runtimeCall = buildRuntimeCall(IRB, runtime.pushPathConstraint,
@@ -494,18 +578,36 @@ void Symbolizer::visitBranchInst(BranchInst &I) {
   registerSymbolicComputation(runtimeCall);
 }
 
+/*
+ * 处理间接跳转指令的符号化（即indirectbr指令）
+ */
 void Symbolizer::visitIndirectBrInst(IndirectBrInst &I) {
   IRBuilder<> IRB(&I);
   tryAlternative(IRB, I.getAddress());
+  /*
+   * 间接跳转指令的跳转地址是一个指针，因此需要对其进行符号化处理。
+   * 这里调用tryAlternative()函数来尝试对跳转地址进行符号化处理。
+   */
 }
 
+/*
+ * 处理函数调用指令的符号化
+ */
 void Symbolizer::visitCallInst(CallInst &I) {
   if (I.isInlineAsm())
     handleInlineAssembly(I);
   else
     handleFunctionCall(I, I.getNextNode());
+  /*
+   * 如果是内联汇编调用，则调用handleInlineAssembly()函数处理，
+   * 否则调用常规的handleFunctionCall()函数处理。
+   */
 }
 
+/*
+ * 处理函数调用指令的符号化（invoke指令）
+ * 比之前的call指令多了一个异常处理，若调用失败会进入异常处理
+ */
 void Symbolizer::visitInvokeInst(InvokeInst &I) {
   // Invoke is like a call but additionally establishes an exception handler. We
   // can obtain the return expression only in the success case, but the target
@@ -513,16 +615,25 @@ void Symbolizer::visitInvokeInst(InvokeInst &I) {
   // this case, we split the edge and query the return expression in the new
   // block that is specific to our edge.
   auto *newBlock = SplitCriticalEdge(I.getParent(), I.getNormalDest());
+  /* 在函数调用和成功返回之间进行分割，因为通向normal块的可能有多条路径，此时往该路径上插桩
+   * 可能会影响到其他路径。因此新建一个newBlock，往newBlock中插桩，就不回影响其他路径。
+   */
   handleFunctionCall(I, newBlock != nullptr
                             ? newBlock->getFirstNonPHI()
                             : I.getNormalDest()->getFirstNonPHI());
+  /* 将函数调用符号化 */
 }
 
+/*
+ * 处理内存分配指令（alloca指令）的符号化
+ */
 void Symbolizer::visitAllocaInst(AllocaInst & /*unused*/) {
   // Nothing to do: the shadow for the newly allocated memory region will be
   // created on first write; until then, the memory contents are concrete.
 }
-
+/*
+ * 处理读取内存指令（load指令）的符号化
+ */
 void Symbolizer::visitLoadInst(LoadInst &I) {
   IRBuilder<> IRB(&I);
 
@@ -539,6 +650,9 @@ void Symbolizer::visitLoadInst(LoadInst &I) {
   symbolicExpressions[&I] = convertBitVectorExprForType(IRB, data, dataType);
 }
 
+/*
+ * 处理写入内存指令（store指令）的符号化
+ */
 void Symbolizer::visitStoreInst(StoreInst &I) {
   IRBuilder<> IRB(&I);
 
@@ -939,15 +1053,24 @@ void Symbolizer::visitInstruction(Instruction &I) {
          << "; the result will be concretized\n";
 }
 
+/*
+ * 创建一个表达式代表具体值concrete
+ */
 Instruction *Symbolizer::createValueExpression(Value *V, IRBuilder<> &IRB) {
   auto *valueType = V->getType();
 
   if (isa<ConstantPointerNull>(V)) {
     return IRB.CreateCall(runtime.buildNullPointer, {});
   }
+  /* 具体值为空的话则返回一个空指针 */
 
-  if (valueType->isIntegerTy()) {
+  if (valueType->isIntegerTy()) {  // 如果具体值为整数的话
     auto bits = valueType->getPrimitiveSizeInBits();
+    /*
+     *  若返回位数为1，则创建一个bool类型返回；
+     *  若返回位数小于等于64，则创建一个int类型返回；
+     *  若返回位数大于64，则创建一个int128类型返回，本质上就是2个int64拼接而成。
+     */
     if (bits == 1) {
       // Special case: LLVM uses the type i1 to represent Boolean values, but
       // for Z3 we have to create expressions of a separate sort.
@@ -1084,13 +1207,20 @@ Symbolizer::SymbolicComputation Symbolizer::forceBuildRuntimeCall(
   return SymbolicComputation(call, call, inputs);
 }
 
+/*
+ * 生成代码，使解算器根据V的值对其符号表达式生成断言约束，
+ * 求解得到符合该值的符号表达式（求解完成），进行对应存储。
+ */
 void Symbolizer::tryAlternative(IRBuilder<> &IRB, Value *V) {
   auto *destExpr = getSymbolicExpression(V);
+  /* 获取V的符号表达式 */
   if (destExpr != nullptr) {
     auto *concreteDestExpr = createValueExpression(V, IRB);
+    /* 获取值表达式 */
     auto *destAssertion =
         IRB.CreateCall(runtime.comparisonHandlers[CmpInst::ICMP_EQ],
                        {destExpr, concreteDestExpr});
+    /* 创建destExpr==concreteDestExpr的表达式 */
     auto *pushAssertion = IRB.CreateCall(
         runtime.pushPathConstraint,
         {destAssertion, IRB.getInt1(true), getTargetPreferredInt(V)});

@@ -44,3 +44,8 @@ compile_commands.json
 
 # Build directories
 build*
+
+/fuzz-run
+/symcc_build
+/symcc_test
+cmake-build-debug
